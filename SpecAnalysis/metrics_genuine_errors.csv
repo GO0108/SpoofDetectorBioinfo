@@ -1,0 +1,12 @@
+../Datasets/CodecFake/data/wavs/genuine/p225/p225_064.wav	Traceback (most recent call last):
+  File "/workspace/marcelo/Deepfake/SpecAnalysis/f0_extraction.py", line 76, in process_file
+    return "ok", extract_one(Path(wav_path_str)), None
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/marcelo/Deepfake/SpecAnalysis/f0_extraction.py", line 34, in extract_one
+    _, _, times_reaper, f0_reaper, corr = pyreaper.reaper(y_int16, sr)
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/pyreaper/__init__.py", line 93, in reaper
+    return reaper_internal(x, fs, minf0, maxf0, do_high_pass,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyreaper/creaper.pyx", line 172, in pyreaper.creaper.reaper_internal
+RuntimeError: EpochTracker TrackEpochs failed

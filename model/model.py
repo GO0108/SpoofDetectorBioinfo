@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 @dataclass
 class ModelConfig:
-    handcrafted_dim: int = 14          # nº de features acústicas (8 escalares + 6 agregados de F0)
+    handcrafted_dim: int = 9           # nº de features acústicas: 3 escalares + 4 de pausa + 2 de F0
     ssl_dim: int = 1024                # dim do XLS-R-300m (768 p/ base)
     d_model: int = 256
     fusion: str = "concat"             # wav2vec_only | handcrafted_only | concat | cross_attention
@@ -254,7 +254,7 @@ def build_model(cfg: Optional[ModelConfig] = None, ssl_backbone=None) -> Deepfak
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     torch.manual_seed(0)
-    B, T, F_DIM, D_SSL, L = 4, 50, 14, 1024, 25
+    B, T, F_DIM, D_SSL, L = 4, 50, 9, 1024, 25   # F_DIM=9: 3 scalares + 4 pausa + 2 F0
     handcrafted = torch.randn(B, F_DIM)
     ssl_features = torch.randn(B, T, D_SSL)
     ssl_hidden = torch.randn(B, L, T, D_SSL)

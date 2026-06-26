@@ -31,7 +31,7 @@ from losses import FeatureLoss
 from dataset import (
     BRSpeechDataset, NpyEmbeddingLoader, NumpyScaler, collate_fn,
     grouped_split, leave_one_model_out, load_chunks, build_feature_frame, map_labels,
-    make_dataloaders,
+    make_dataloaders, resolve_feature_subset,
 )
 
 
@@ -227,6 +227,8 @@ def _resolve_io(args):
 def run_lomo(args, device):
     df = load_chunks(args.metrics_path)
     df, feature_names = build_feature_frame(df)
+    from dataset import resolve_feature_subset
+    feature_names = resolve_feature_subset(feature_names, args.feature_subset)
     y_bin, _ = map_labels(df["model"], multiclass=False, bonafide_aliases=args.bonafide_aliases)
 
     emb_loader, wav_loader, backbone, freeze = _resolve_io(args)
@@ -277,12 +279,14 @@ def run_standard(args, device):
         args.metrics_path, multiclass=args.multiclass, batch_size=args.batch_size,
         seed=args.seed, embedding_loader=emb_loader, waveform_loader=wav_loader,
         bonafide_aliases=args.bonafide_aliases,
+        feature_subset=args.feature_subset,
     )
     num_classes = len(bundle.label_info.classes)
     cfg = ModelConfig(handcrafted_dim=len(bundle.feature_names), fusion=args.fusion,
                       num_classes=num_classes, d_model=args.d_model, freeze_ssl=freeze)
-    print(f"features={len(bundle.feature_names)}  classes={bundle.label_info.classes}  "
-          f"fusion={args.fusion}")
+    print(f"features={len(bundle.feature_names)}  subset={args.feature_subset}  "
+          f"classes={bundle.label_info.classes}  fusion={args.fusion}  "
+          f"feature_names={bundle.feature_names}")
     print(f"split: {{ {', '.join(f'{k}={len(v.dataset)}' for k, v in bundle.loaders.items())} }}")
 
     train_y = bundle.frame.iloc[bundle.splits["train"]]["model"]
@@ -337,6 +341,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--bonafide-aliases", nargs="+", default=["bonafide", "real", "genuine", "human", "bona"])
     p.add_argument("--out", type=str, default=None, help="caminho p/ salvar checkpoint")
+    p.add_argument(
+        "--feature-subset", type=str, default="all",
+        metavar="SUBSET",
+        help=(
+            "Subconjunto de features handcrafted para ablação. "
+            "Valores: all | scalar | pause | f0 | combinações com vírgula "
+            "(ex: scalar,pause). Default: all."
+        ),
+    )
     p.add_argument("--quiet", dest="verbose", action="store_false")
     return p
 

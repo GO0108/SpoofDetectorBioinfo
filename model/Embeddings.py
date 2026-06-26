@@ -228,9 +228,11 @@ if __name__ == "__main__":
                     n = int(rng.integers(80, 120)); f0 = rng.normal(150, 30, n); f0[rng.random(n) < .4] = -1
                     rows.append(dict(file=f"{spk}_{mdl}_{rng.integers(1_000_000)}.flac", path="/x/a.flac",
                         model=mdl, patient=f"spk{spk}", f0_reaper=f0, corr=np.clip(rng.normal(.7, .1, n), 0, 1),
-                        jitter_local_pct=rng.normal(.5, .2), jitter_rap_pct=.3, jitter_ppq5_pct=.3, jitter_ddp_pct=.9,
-                        shimmer_local_pct=3., shimmer_dB=.3, shimmer_apq3_pct=1.5, shimmer_apq5_pct=1.8,
-                        shimmer_dda_pct=4.5, hnr_mean_dB=18.))
+                        # SCALAR_FEATURES
+                        jitter_local_pct=rng.normal(.5, .2), shimmer_local_pct=3., hnr_mean_dB=18.,
+                        # PAUSE_FEATURES
+                        rms_mean=abs(rng.normal(.01, .005)), zcr_mean=abs(rng.normal(.08, .02)),
+                        n_pausas=int(rng.integers(10, 40)), pause_dur_mean=abs(rng.normal(.18, .06))))
         pq = Path(d) / "m.parquet"; pd.DataFrame(rows).to_parquet(pq, index=False)
         dyn = DynamicEmbeddingLoader(FakeExtractor(), cache_dir=str(Path(d) / "c2"), in_memory=True)
         bundle = DS.make_dataloaders(str(pq), batch_size=8, embedding_loader=dyn, num_workers=0)

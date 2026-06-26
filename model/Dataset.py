@@ -13,9 +13,9 @@ Pipeline:
 
 Schema esperado (de extract_metrics.py):
     file, path, model, patient, times_reaper, f0_reaper, corr,
-    jitter_local_pct, jitter_rap_pct, jitter_ppq5_pct, jitter_ddp_pct,
-    shimmer_local_pct, shimmer_dB, shimmer_apq3_pct, shimmer_apq5_pct,
-    shimmer_dda_pct, hnr_mean_dB
+    jitter_local_pct, shimmer_local_pct, hnr_mean_dB,
+    rms_mean, zcr_mean, n_pausas, pause_dur_mean
+    (+ demais colunas do parquet ignoradas pelo loader)
 """
 
 from __future__ import annotations
@@ -31,15 +31,36 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-# Escalares mantidos (ddp/dda removidos por colinearidade exata)
+# Escalares mantidos: apenas as features selecionadas para fusão com XLS-R.
+# Variantes redundantes de jitter/shimmer (rap, ppq5, ddp, dB, apq3, apq5, dda)
+# foram removidas; somente local é mantido para cada um.
 SCALAR_FEATURES: list[str] = [
-    "jitter_local_pct", "jitter_rap_pct", "jitter_ppq5_pct",
-    "shimmer_local_pct", "shimmer_dB", "shimmer_apq3_pct", "shimmer_apq5_pct",
+    "jitter_local_pct",
+    "shimmer_local_pct",
     "hnr_mean_dB",
 ]
-F0_AGG_FEATURES: list[str] = [
-    "f0_mean", "f0_std", "f0_median", "f0_range", "voiced_fraction", "corr_mean",
+# Features de pausa derivadas de frames unvoiced (f0 < 0 no REAPER).
+# Ressalva: incluem consoantes surdas além de silêncio puro — ver notebook de análise.
+PAUSE_FEATURES: list[str] = [
+    "rms_mean",
+    "zcr_mean",
+    "n_pausas",
+    "pause_dur_mean",
 ]
+# Agregados de F0 mantidos: média e desvio (os mais discriminativos segundo KL).
+# f0_median, f0_range, voiced_fraction e corr_mean foram descartados.
+F0_AGG_FEATURES: list[str] = [
+    "f0_mean",
+    "f0_std",
+]
+# Grupos para ablação via --feature-subset
+# Chaves: "scalar" | "pause" | "f0" | combinações com vírgula | "all"
+FEATURE_GROUPS: dict[str, list[str]] = {
+    "scalar": ["jitter_local_pct", "shimmer_local_pct", "hnr_mean_dB"],
+    "pause":  ["rms_mean", "zcr_mean", "n_pausas", "pause_dur_mean"],
+    "f0":     ["f0_mean", "f0_std"],
+}
+
 BONAFIDE_ALIASES: tuple[str, ...] = ("bonafide", "real", "genuine", "human", "bona")
 
 
@@ -70,34 +91,49 @@ def aggregate_f0_row(f0_reaper, corr) -> dict:
     v = f0[voiced]
     if v.size == 0:
         return {k: np.nan for k in F0_AGG_FEATURES}
-    out = {
+    return {
         "f0_mean": float(v.mean()),
-        "f0_std": float(v.std()),
-        "f0_median": float(np.median(v)),
-        "f0_range": float(np.ptp(v)),
-        "voiced_fraction": float(v.size / f0.size),
-        "corr_mean": np.nan,
+        "f0_std":  float(v.std()),
     }
-    if corr is not None:
-        c = np.asarray(corr, dtype=float)
-        if c.size == f0.size:
-            out["corr_mean"] = float(c[voiced].mean())
-    return out
 
 
 def build_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Garante todas as colunas handcrafted. Agrega F0 se o contorno existir;
-    caso contrário, assume que os agregados já estão no parquet."""
+    """Garante todas as colunas handcrafted e monta a lista de features na ordem canônica.
+
+    Ordem das 9 features para fusão com XLS-R:
+        jitter_local_pct, shimmer_local_pct, hnr_mean_dB  (SCALAR_FEATURES)
+        rms_mean, zcr_mean, n_pausas, pause_dur_mean       (PAUSE_FEATURES)
+        f0_mean, f0_std                                    (F0_AGG_FEATURES)
+
+    - Agrega F0 a partir do contorno REAPER se a coluna 'f0_reaper' existir;
+      caso contrário, assume que 'f0_mean'/'f0_std' já estão no parquet.
+    - Features de pausa devem estar no parquet (produzidas pela seção 4 do
+      notebook de análise). Se ausentes, levanta KeyError com instrução.
+    """
     df = df.copy()
+
+    # Agrega F0 se o contorno estiver disponível
     if "f0_reaper" in df.columns:
         aggs = [aggregate_f0_row(r.f0_reaper, getattr(r, "corr", None))
                 for r in df.itertuples(index=False)]
         df = pd.concat([df.reset_index(drop=True), pd.DataFrame(aggs)], axis=1)
 
-    feature_names = [c for c in (SCALAR_FEATURES + F0_AGG_FEATURES) if c in df.columns]
-    missing = set(SCALAR_FEATURES) - set(df.columns)
+    # Valida features obrigatórias
+    required = set(SCALAR_FEATURES) | set(PAUSE_FEATURES) | set(F0_AGG_FEATURES)
+    missing = required - set(df.columns)
     if missing:
+        pause_missing = missing & set(PAUSE_FEATURES)
+        if pause_missing:
+            raise KeyError(
+                f"Features de pausa ausentes no parquet: {sorted(pause_missing)}. "
+                "Certifique-se de ter rodado a extração de pausas do notebook de análise "
+                "(seção 4) e salvo as colunas rms_mean, zcr_mean, n_pausas e pause_dur_mean."
+            )
         raise KeyError(f"Colunas de feature ausentes no parquet: {sorted(missing)}")
+
+    # Ordem canônica: scalar -> pausa -> f0
+    all_features = SCALAR_FEATURES + PAUSE_FEATURES + F0_AGG_FEATURES
+    feature_names = [c for c in all_features if c in df.columns]
     return df, feature_names
 
 
@@ -281,6 +317,35 @@ class DataBundle:
     splits: dict = field(repr=False, default_factory=dict)
 
 
+def resolve_feature_subset(feature_names: list[str], subset: str) -> list[str]:
+    """Filtra feature_names para o subconjunto pedido.
+
+    subset pode ser:
+        "all"                → todas as features (sem filtro)
+        "scalar"             → só FEATURE_GROUPS["scalar"]
+        "pause"              → só FEATURE_GROUPS["pause"]
+        "f0"                 → só FEATURE_GROUPS["f0"]
+        "scalar,pause"       → união de dois grupos (qualquer combinação)
+        "scalar,pause,f0"    → equivalente a "all"
+
+    Apenas features que efetivamente existem em feature_names são retornadas
+    (evita KeyError se uma coluna estiver ausente no parquet).
+    """
+    if subset == "all":
+        return feature_names
+    requested: list[str] = []
+    for group_key in subset.split(","):
+        group_key = group_key.strip()
+        if group_key not in FEATURE_GROUPS:
+            raise ValueError(
+                f"Subconjunto de feature desconhecido: '{group_key}'. "
+                f"Válidos: {sorted(FEATURE_GROUPS)} ou 'all'."
+            )
+        requested.extend(FEATURE_GROUPS[group_key])
+    # Mantém a ordem canônica e só o que existe no parquet
+    return [f for f in feature_names if f in requested]
+
+
 def make_dataloaders(
     metrics_path: str | Path,
     multiclass: bool = False,
@@ -291,9 +356,16 @@ def make_dataloaders(
     waveform_loader: Optional[Callable] = None,
     bonafide_aliases: Sequence[str] = BONAFIDE_ALIASES,
     num_workers: int = 0,
+    feature_subset: str = "all",
 ) -> DataBundle:
     df = load_chunks(metrics_path)
     df, feature_names = build_feature_frame(df)
+    feature_names = resolve_feature_subset(feature_names, feature_subset)
+    if not feature_names:
+        raise ValueError(
+            f"Nenhuma feature disponível para subset='{feature_subset}'. "
+            "Verifique se as colunas existem no parquet."
+        )
     y, label_info = map_labels(df["model"], multiclass, bonafide_aliases)
     splits = grouped_split(df["patient"], fracs, seed)
 
@@ -330,17 +402,17 @@ if __name__ == "__main__":
                     "file": f"{patient}_{model}_{rng.integers(1e6)}.flac",
                     "path": f"/data/{model}/{patient}/x.flac",
                     "model": model, "patient": patient,
+                    # contorno de F0 (agregado em build_feature_frame)
                     "f0_reaper": f0, "corr": np.clip(rng.normal(0.7, 0.1, n), 0, 1),
-                    "jitter_local_pct": rng.normal(0.5, 0.2),
-                    "jitter_rap_pct": rng.normal(0.3, 0.1),
-                    "jitter_ppq5_pct": rng.normal(0.3, 0.1),
-                    "jitter_ddp_pct": rng.normal(0.9, 0.3),
-                    "shimmer_local_pct": rng.normal(3, 1),
-                    "shimmer_dB": rng.normal(0.3, 0.1),
-                    "shimmer_apq3_pct": rng.normal(1.5, 0.5),
-                    "shimmer_apq5_pct": rng.normal(1.8, 0.5),
-                    "shimmer_dda_pct": rng.normal(4.5, 1.5),
-                    "hnr_mean_dB": rng.normal(18, 3),
+                    # SCALAR_FEATURES
+                    "jitter_local_pct":  rng.normal(0.5, 0.2),
+                    "shimmer_local_pct": rng.normal(3.0, 1.0),
+                    "hnr_mean_dB":       rng.normal(18.0, 3.0),
+                    # PAUSE_FEATURES (normalmente produzidas pelo notebook seção 4)
+                    "rms_mean":       abs(rng.normal(0.01, 0.005)),
+                    "zcr_mean":       abs(rng.normal(0.08, 0.02)),
+                    "n_pausas":       int(rng.integers(10, 40)),
+                    "pause_dur_mean": abs(rng.normal(0.18, 0.06)),
                 })
     df = pd.DataFrame(rows)
 

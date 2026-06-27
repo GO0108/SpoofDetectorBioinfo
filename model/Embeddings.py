@@ -227,7 +227,7 @@ if __name__ == "__main__":
                 for _ in range(3):
                     n = int(rng.integers(80, 120)); f0 = rng.normal(150, 30, n); f0[rng.random(n) < .4] = -1
                     rows.append(dict(file=f"{spk}_{mdl}_{rng.integers(1_000_000)}.flac", path="/x/a.flac",
-                        model=mdl, patient=f"spk{spk}", f0_reaper=f0, corr=np.clip(rng.normal(.7, .1, n), 0, 1),
+                        model=mdl, speaker=f"spk{spk}", f0_reaper=f0, corr=np.clip(rng.normal(.7, .1, n), 0, 1),
                         # SCALAR_FEATURES
                         jitter_local_pct=rng.normal(.5, .2), shimmer_local_pct=3., hnr_mean_dB=18.,
                         # PAUSE_FEATURES

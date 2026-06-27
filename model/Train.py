@@ -225,6 +225,10 @@ def _resolve_io(args):
 # Leave-one-spoof_model-out
 # --------------------------------------------------------------------------- #
 def run_lomo(args, device):
+    if args.feature_cache_dir:
+        print("[AVISO] --feature-cache-dir é ignorado em --lomo "
+              "(cada modelo retido gera um split treino/val/teste diferente; "
+              "o cache de 3 arquivos fixos não se aplica aqui).")
     df = load_chunks(args.metrics_path)
     df, feature_names = build_feature_frame(df)
     from dataset import resolve_feature_subset
@@ -235,7 +239,7 @@ def run_lomo(args, device):
     rows = []
     for held, tr_all, te in leave_one_model_out(df["model"], args.bonafide_aliases):
         # split interno treino/val por locutor (sem vazamento)
-        sub_split = grouped_split(df.iloc[tr_all]["patient"], fracs=(0.85, 0.15, 0.0), seed=args.seed)
+        sub_split = grouped_split(df.iloc[tr_all]["speaker"], fracs=(0.85, 0.15, 0.0), seed=args.seed)
         tr = tr_all[sub_split["train"]]
         va = tr_all[sub_split["val"]] if len(sub_split["val"]) else tr_all[sub_split["test"]]
 
@@ -280,6 +284,7 @@ def run_standard(args, device):
         seed=args.seed, embedding_loader=emb_loader, waveform_loader=wav_loader,
         bonafide_aliases=args.bonafide_aliases,
         feature_subset=args.feature_subset,
+        feature_cache_dir=args.feature_cache_dir,
     )
     num_classes = len(bundle.label_info.classes)
     cfg = ModelConfig(handcrafted_dim=len(bundle.feature_names), fusion=args.fusion,
@@ -350,14 +355,28 @@ def build_argparser() -> argparse.ArgumentParser:
             "(ex: scalar,pause). Default: all."
         ),
     )
+    p.add_argument(
+        "--feature-cache-dir", type=str, default=None, metavar="DIR",
+        help=(
+            "Diretório de cache do split train/dev/test já processado "
+            "(<DIR>/train_features.parquet, dev_features.parquet, test_features.parquet). "
+            "Se os 3 arquivos já existirem, a extração (carregar chunks + agregar "
+            "F0 + dividir por locutor) é PULADA. Caso contrário, ela roda "
+            "normalmente e o resultado é salvo nesse diretório. Útil em ablações "
+            "(várias chamadas de Train.py no mesmo --feature-cache-dir reusam a "
+            "mesma extração). Não se aplica com --lomo."
+        ),
+    )
     p.add_argument("--quiet", dest="verbose", action="store_false")
+    p.add_argument("--device", type=str, default=None,
+                   help="cpu | cuda | cuda:0 ... (default: detecta automaticamente)")
     return p
 
 
 def main():
     args = build_argparser().parse_args()
     set_seed(args.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
     t0 = time.time()
     if args.lomo:

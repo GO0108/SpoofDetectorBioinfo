@@ -6,13 +6,32 @@ Pipeline:
     1. carrega/concatena todos os parquets de métricas (chunks)
     2. agrega o contorno de F0 do REAPER em escalares (mascarando frames -1)
     3. monta o vetor handcrafted, dropando colineares exatos (ddp = 3*rap, dda = 3*apq3)
-    4. mapeia o rótulo a partir da coluna `model` (bonafide -> 0, spoof -> >=1)
-    5. divide por `patient` (split agrupado, sem vazamento de locutor)
+    4. divide por `speaker` (split agrupado, sem vazamento de locutor)
+    5. mapeia o rótulo a partir da coluna `model` (bonafide -> 0, spoof -> >=1),
+       de forma consistente entre os 3 splits
     6. padroniza as features ajustando o scaler SÓ no treino
     7. (opcional) anexa embeddings XLS-R por utterance para a fusão
 
+Cache de features por split (train/dev/test):
+    Os passos 1-4 (carregar chunks, agregar F0, montar handcrafted, dividir
+    por locutor) são determinísticos dado (metrics_path, seed, fracs) e podem
+    ser caros de repetir — é exatamente o que acontece numa ablação como a do
+    run_experiments.sh, que chama Train.py ~15 vezes sobre o mesmo parquet.
+
+    Passando `feature_cache_dir=...` para make_dataloaders():
+      - Se os 3 arquivos abaixo já existirem, a extração é PULADA e eles são
+        lidos diretamente (apenas a leitura do parquet, sem recomputar nada):
+            <feature_cache_dir>/train_features.parquet
+            <feature_cache_dir>/dev_features.parquet
+            <feature_cache_dir>/test_features.parquet
+      - Caso contrário, a extração roda normalmente e o resultado de cada
+        split é salvo nesses caminhos para a próxima chamada reusar.
+    A checagem é só de existência dos arquivos (não recalcula/valida
+    conteúdo); se mudar `seed`/`fracs`/o parquet de entrada, apague o
+    diretório de cache (ou aponte para outro) para forçar uma nova extração.
+
 Schema esperado (de extract_metrics.py):
-    file, path, model, patient, times_reaper, f0_reaper, corr,
+    file, path, split, model, speaker, times_reaper, f0_reaper, corr,
     jitter_local_pct, shimmer_local_pct, hnr_mean_dB,
     rms_mean, zcr_mean, n_pausas, pause_dur_mean
     (+ demais colunas do parquet ignoradas pelo loader)
@@ -21,6 +40,7 @@ Schema esperado (de extract_metrics.py):
 from __future__ import annotations
 
 import glob
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -62,6 +82,87 @@ FEATURE_GROUPS: dict[str, list[str]] = {
 }
 
 BONAFIDE_ALIASES: tuple[str, ...] = ("bonafide", "real", "genuine", "human", "bona")
+
+SPLIT_NAMES: tuple[str, ...] = ("train", "val", "test")
+
+
+# --------------------------------------------------------------------------- #
+# Cache de features por split (train/dev/test) — ver docstring do módulo
+# --------------------------------------------------------------------------- #
+# Nome de arquivo no cache para cada split interno. "val" é salvo como "dev"
+# (sinônimo comum em protocolos de anti-spoofing: train / dev / eval).
+FEATURE_CACHE_FILENAMES: dict[str, str] = {
+    "train": "train_features.parquet",
+    "val":   "dev_features.parquet",
+    "test":  "test_features.parquet",
+}
+
+# Colunas de contorno (arrays) já resumidas em escalares por build_feature_frame;
+# não precisam ir para o cache e nem sempre são serializáveis em parquet simples.
+_ARRAY_COLUMNS_TO_DROP: tuple[str, ...] = ("times_reaper", "f0_reaper", "corr")
+
+
+def feature_cache_paths(cache_dir: str | Path) -> dict[str, Path]:
+    cache_dir = Path(cache_dir)
+    return {name: cache_dir / fname for name, fname in FEATURE_CACHE_FILENAMES.items()}
+
+
+def _cache_meta_path(cache_dir: str | Path) -> Path:
+    return Path(cache_dir) / "meta.json"
+
+
+def load_feature_cache(
+    cache_dir: str | Path,
+    seed: Optional[int] = None,
+    fracs: Optional[Sequence[float]] = None,
+) -> Optional[dict[str, pd.DataFrame]]:
+    """Devolve {"train","val","test": DataFrame} se os 3 parquets já existirem
+    em `cache_dir`; devolve None se o cache estiver ausente ou incompleto
+    (sinal para o chamador rodar a extração normalmente).
+
+    A checagem é SÓ de existência dos arquivos — não recalcula nada. Se
+    `seed`/`fracs` forem passados e diferirem do que está em meta.json (salvo
+    junto do cache), apenas um aviso é impresso; o cache é usado do mesmo jeito.
+    """
+    paths = feature_cache_paths(cache_dir)
+    if not all(p.exists() for p in paths.values()):
+        return None
+
+    meta_path = _cache_meta_path(cache_dir)
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+        if seed is not None and meta.get("seed") not in (None, seed):
+            print(f"[cache][AVISO] seed do cache ({meta.get('seed')}) difere do "
+                  f"seed atual ({seed}); usando o cache existente mesmo assim "
+                  f"(apague {cache_dir} para forçar nova extração).")
+        if fracs is not None and meta.get("fracs") not in (None, list(fracs)):
+            print(f"[cache][AVISO] fracs do cache ({meta.get('fracs')}) difere do "
+                  f"atual ({list(fracs)}); usando o cache existente mesmo assim "
+                  f"(apague {cache_dir} para forçar nova extração).")
+
+    return {name: pd.read_parquet(p) for name, p in paths.items()}
+
+
+def save_feature_cache(
+    cache_dir: str | Path,
+    split_frames: dict[str, pd.DataFrame],
+    seed: Optional[int] = None,
+    fracs: Optional[Sequence[float]] = None,
+) -> None:
+    """Salva cada split (já com as features handcrafted construídas) em
+    <cache_dir>/{train,dev,test}_features.parquet + meta.json (seed/fracs)."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = feature_cache_paths(cache_dir)
+    for name, frame in split_frames.items():
+        drop = [c for c in _ARRAY_COLUMNS_TO_DROP if c in frame.columns]
+        frame.drop(columns=drop).to_parquet(paths[name], index=False)
+    _cache_meta_path(cache_dir).write_text(
+        json.dumps({"seed": seed, "fracs": list(fracs) if fracs is not None else None})
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -195,7 +296,7 @@ class NumpyScaler:
 # Split agrupado por locutor
 # --------------------------------------------------------------------------- #
 def grouped_split(groups: pd.Series, fracs=(0.7, 0.15, 0.15), seed: int = 0) -> dict:
-    """Divide mantendo cada `patient` inteiro num único split."""
+    """Divide mantendo cada valor de `groups` (ex.: `speaker`) inteiro num único split."""
     assert abs(sum(fracs) - 1.0) < 1e-6, "fracs deve somar 1"
     uniq = np.array(groups.astype(str).unique(), dtype=object)
     rng = np.random.default_rng(seed)
@@ -357,29 +458,84 @@ def make_dataloaders(
     bonafide_aliases: Sequence[str] = BONAFIDE_ALIASES,
     num_workers: int = 0,
     feature_subset: str = "all",
+    feature_cache_dir: Optional[str | Path] = None,
 ) -> DataBundle:
-    df = load_chunks(metrics_path)
-    df, feature_names = build_feature_frame(df)
-    feature_names = resolve_feature_subset(feature_names, feature_subset)
+    """
+    feature_cache_dir:
+        Se informado, faz cache em disco do split train/dev/test já com as
+        features handcrafted construídas (pós build_feature_frame +
+        grouped_split). Se os 3 parquets já existirem nesse diretório, a
+        extração (load_chunks + build_feature_frame + grouped_split) é
+        PULADA e eles são lidos diretamente; caso contrário, a extração roda
+        normalmente e o resultado é salvo lá para a próxima chamada. Ver
+        docstring do módulo para os nomes de arquivo. `--feature-subset` é
+        aplicado depois da leitura do cache, então o mesmo cache serve para
+        qualquer ablação de subconjunto de features.
+    """
+    cached = load_feature_cache(feature_cache_dir, seed=seed, fracs=fracs) if feature_cache_dir else None
+
+    if cached is not None:
+        print(f"[cache] features já extraídas encontradas em '{feature_cache_dir}' "
+              "— pulando extração e usando o cache.")
+        split_frames = cached
+        feature_names_all = [
+            c for c in (SCALAR_FEATURES + PAUSE_FEATURES + F0_AGG_FEATURES)
+            if c in split_frames["train"].columns
+        ]
+    else:
+        df = load_chunks(metrics_path)
+        df, feature_names_all = build_feature_frame(df)
+        idx_splits = grouped_split(df["speaker"], fracs, seed)
+        split_frames = {
+            name: df.iloc[idx].reset_index(drop=True) for name, idx in idx_splits.items()
+        }
+        if feature_cache_dir:
+            save_feature_cache(feature_cache_dir, split_frames, seed=seed, fracs=fracs)
+            print(f"[cache] features extraídas e salvas em '{feature_cache_dir}' "
+                  "(próximas chamadas vão pular a extração).")
+
+    feature_names = resolve_feature_subset(feature_names_all, feature_subset)
     if not feature_names:
         raise ValueError(
             f"Nenhuma feature disponível para subset='{feature_subset}'. "
-            "Verifique se as colunas existem no parquet."
+            "Verifique se as colunas existem no parquet/cache."
         )
-    y, label_info = map_labels(df["model"], multiclass, bonafide_aliases)
-    splits = grouped_split(df["patient"], fracs, seed)
 
-    scaler = NumpyScaler().fit(df.iloc[splits["train"]][feature_names].to_numpy(dtype=float))
+    # Mapeia rótulos de forma CONSISTENTE entre os 3 splits — importante no
+    # multiclasse, onde o id de cada spoof_model não pode depender de quais
+    # splits foram vistos primeiro (ex.: ao ler do cache, cada split vem de um
+    # parquet separado em vez de um único df pré-split).
+    combined_models = pd.concat(
+        [split_frames[n]["model"] for n in SPLIT_NAMES], ignore_index=True
+    )
+    y_combined, label_info = map_labels(combined_models, multiclass, bonafide_aliases)
+    lens = {n: len(split_frames[n]) for n in SPLIT_NAMES}
+    y_splits, offset = {}, 0
+    for n in SPLIT_NAMES:
+        y_splits[n] = y_combined[offset: offset + lens[n]]
+        offset += lens[n]
+
+    scaler = NumpyScaler().fit(split_frames["train"][feature_names].to_numpy(dtype=float))
 
     loaders = {}
-    for name, idx in splits.items():
-        ds = BRSpeechDataset(df.iloc[idx], feature_names, y[idx], scaler,
+    for name in SPLIT_NAMES:
+        ds = BRSpeechDataset(split_frames[name], feature_names, y_splits[name], scaler,
                              embedding_loader, waveform_loader)
         loaders[name] = DataLoader(
             ds, batch_size=batch_size, shuffle=(name == "train"),
             collate_fn=collate_fn, num_workers=num_workers,
         )
-    return DataBundle(loaders, scaler, feature_names, label_info, df, splits)
+
+    # Mantém DataBundle.frame/.splits no mesmo formato de antes (um único
+    # frame concatenado + índices posicionais por split), para não quebrar
+    # quem já consome esses dois atributos (ex.: Train.py, smoke tests).
+    combined_frame = pd.concat([split_frames[n] for n in SPLIT_NAMES], ignore_index=True)
+    splits_idx, offset = {}, 0
+    for n in SPLIT_NAMES:
+        splits_idx[n] = np.arange(offset, offset + lens[n])
+        offset += lens[n]
+
+    return DataBundle(loaders, scaler, feature_names, label_info, combined_frame, splits_idx)
 
 
 # --------------------------------------------------------------------------- #
@@ -392,16 +548,16 @@ if __name__ == "__main__":
     models = ["bonafide", "tts_a", "vc_b"]
     rows = []
     for spk in range(8):                                   # 8 locutores
-        patient = f"spk{spk:02d}"
+        speaker = f"spk{spk:02d}"
         for model in models:
             for _ in range(rng.integers(3, 6)):
                 n = int(rng.integers(80, 160))
                 f0 = rng.normal(150, 30, n)
                 f0[rng.random(n) < 0.4] = -1.0             # frames não-vozeados
                 rows.append({
-                    "file": f"{patient}_{model}_{rng.integers(1e6)}.flac",
-                    "path": f"/data/{model}/{patient}/x.flac",
-                    "model": model, "patient": patient,
+                    "file": f"{speaker}_{model}_{rng.integers(1e6)}.flac",
+                    "path": f"/data/{model}/{speaker}/x.flac",
+                    "model": model, "speaker": speaker,
                     # contorno de F0 (agregado em build_feature_frame)
                     "f0_reaper": f0, "corr": np.clip(rng.normal(0.7, 0.1, n), 0, 1),
                     # SCALAR_FEATURES
@@ -428,8 +584,8 @@ if __name__ == "__main__":
         print("tamanhos:", {k: len(v.dataset) for k, v in bundle.loaders.items()})
 
         # sem vazamento de locutor entre splits
-        pat = {k: set(bundle.frame.iloc[ix]["patient"]) for k, ix in bundle.splits.items()}
-        overlap = (pat["train"] & pat["val"]) | (pat["train"] & pat["test"]) | (pat["val"] & pat["test"])
+        spk_sets = {k: set(bundle.frame.iloc[ix]["speaker"]) for k, ix in bundle.splits.items()}
+        overlap = (spk_sets["train"] & spk_sets["val"]) | (spk_sets["train"] & spk_sets["test"]) | (spk_sets["val"] & spk_sets["test"])
         print("locutores sobrepostos entre splits:", overlap or "nenhum")
 
         batch = next(iter(bundle.loaders["train"]))
@@ -439,4 +595,29 @@ if __name__ == "__main__":
         # leave-one-model-out
         for held, tr, te in leave_one_model_out(bundle.frame["model"]):
             print(f"LOMO held={held:8s} train={len(tr):3d} test={len(te):3d}")
+
+        # --- cache de features por split (train/dev/test) -------------------- #
+        cache_dir = Path(d) / "feature_cache"
+        print(f"\n[teste cache] diretório: {cache_dir}  (não existe ainda)")
+        b1 = make_dataloaders(d, multiclass=True, batch_size=16, seed=1,
+                              feature_cache_dir=cache_dir)
+        assert feature_cache_paths(cache_dir)["train"].exists(), "cache de treino não foi salvo"
+        assert feature_cache_paths(cache_dir)["val"].exists(), "cache de dev não foi salvo"
+        assert feature_cache_paths(cache_dir)["test"].exists(), "cache de test não foi salvo"
+
+        print(f"[teste cache] chamando de novo com o MESMO cache_dir — deve pular a extração")
+        b2 = make_dataloaders(d, multiclass=True, batch_size=16, seed=1,
+                              feature_cache_dir=cache_dir)
+        assert b1.feature_names == b2.feature_names
+        assert b1.label_info.classes == b2.label_info.classes
+        assert {k: len(v.dataset) for k, v in b1.loaders.items()} == \
+               {k: len(v.dataset) for k, v in b2.loaders.items()}
+        assert np.allclose(b1.scaler.mean_, b2.scaler.mean_, equal_nan=True)
+        print("[teste cache] OK — segunda chamada usou o cache e bateu com a primeira")
+
+        # --feature-subset diferente deve reusar o MESMO cache (filtro é pós-cache)
+        b3 = make_dataloaders(d, multiclass=True, batch_size=16, seed=1,
+                              feature_cache_dir=cache_dir, feature_subset="pause")
+        print(f"[teste cache] subset='pause' sobre o mesmo cache -> features={b3.feature_names}")
+        assert b3.feature_names == FEATURE_GROUPS["pause"]
     print("OK")

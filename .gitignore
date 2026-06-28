@@ -1,1 +1,3 @@
 feature_extraction/metrics_chunks/
+results/
+extract_train.log

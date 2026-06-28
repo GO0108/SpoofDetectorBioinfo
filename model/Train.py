@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -148,7 +149,8 @@ def build_optimizer(model, lr: float, backbone_lr: float, weight_decay: float):
 def train_one_run(cfg: ModelConfig, train_loader, val_loader, *,
                   train_labels: np.ndarray, ssl_backbone=None, epochs=30, lr=1e-3,
                   backbone_lr=1e-5, weight_decay=1e-4, use_feature_loss=False,
-                  alpha=1.0, beta=1.0, patience=5, device="cpu", verbose=True):
+                  alpha=1.0, beta=1.0, patience=5, device="cpu", verbose=True,
+                  tb_writer=None):
     model = build_model(cfg, ssl_backbone=ssl_backbone).to(device)
     emb_dim = cfg.d_model * (2 if cfg.fusion == "concat" else 1)
     cw = class_weights_from_labels(train_labels, cfg.num_classes).to(device)
@@ -164,20 +166,37 @@ def train_one_run(cfg: ModelConfig, train_loader, val_loader, *,
     for ep in range(1, epochs + 1):
         model.train()
         running = 0.0
+        loss_parts_sum = None
         for batch in train_loader:
             opt.zero_grad()
             out = model(**_model_inputs(batch, device))
-            loss, _ = crit(out["logits"], out["embedding"], batch["label"].to(device))
+            loss, parts = crit(out["logits"], out["embedding"], batch["label"].to(device))
             loss.backward()
             opt.step()
-            running += float(loss.detach()) * len(batch["label"])
-        train_loss = running / len(train_loader.dataset)
+            bs = len(batch["label"])
+            running += float(loss.detach()) * bs
+            if tb_writer is not None:
+                if loss_parts_sum is None:
+                    loss_parts_sum = {k: 0.0 for k in parts}
+                for k, v in parts.items():
+                    loss_parts_sum[k] += float(v) * bs
+        n = len(train_loader.dataset)
+        train_loss = running / n
         val = evaluate(model, val_loader, device, cfg.num_classes)
         history.append({"epoch": ep, "train_loss": train_loss, **val})
         if verbose:
             print(f"  ep {ep:02d}  loss={train_loss:.4f}  "
                   f"val EER={val['eer']:.4f}  AUC={val['auc']:.4f}  "
                   f"acc={val['acc']:.3f}  f1={val['f1']:.3f}")
+        if tb_writer is not None:
+            tb_writer.add_scalar("train/loss", train_loss, ep)
+            if loss_parts_sum is not None:
+                for k, total in loss_parts_sum.items():
+                    tb_writer.add_scalar(f"train/loss_{k}", total / n, ep)
+            tb_writer.add_scalar("val/eer", val["eer"], ep)
+            tb_writer.add_scalar("val/auc", val["auc"], ep)
+            tb_writer.add_scalar("val/acc", val["acc"], ep)
+            tb_writer.add_scalar("val/f1", val["f1"], ep)
         if val["eer"] < best["eer"]:
             best = val
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -206,6 +225,45 @@ def loaders_from_indices(frame, feature_names, y, idx_map: dict, scaler, *,
         loaders[name] = DataLoader(ds, batch_size=batch_size, shuffle=(name == "train"),
                                    collate_fn=collate_fn, num_workers=num_workers)
     return loaders
+
+
+def _make_tb_writer(tb_dir: Optional[str], run_name: str):
+    """Cria um SummaryWriter em <tb_dir>/<run_name>, ou None se tb_dir não
+    foi passado. Cada run (cada ablação) ganha sua própria subpasta, então
+    `tensorboard --logdir <tb_dir>` mostra todas as curvas juntas, uma cor
+    por experimento."""
+    if not tb_dir:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("[AVISO] --tb-dir foi passado mas o pacote 'tensorboard' não "
+              "está instalado. Rode: pip install tensorboard --break-system-packages")
+        return None
+    log_dir = str(Path(tb_dir) / run_name)
+    print(f"  [tensorboard] logando em {log_dir}")
+    return SummaryWriter(log_dir=log_dir)
+
+
+def _infer_ssl_dim(loader, backbone) -> Optional[int]:
+    """Descobre a dimensão real do embedding SSL em uso. ModelConfig.ssl_dim
+    tem default 1024 (tamanho do wav2vec2-xls-r-300m) só por conveniência —
+    se o backbone/embedding usado tiver outra dimensão (--ssl-model diferente,
+    .npy de outro extractor, etc.), confiar nesse default dá um erro de shape
+    mismatch bem confuso lá no forward do modelo. Aqui a dimensão é checada
+    direto na fonte (config do backbone, ou o primeiro batch de verdade)."""
+    if backbone is not None and hasattr(backbone, "config"):
+        dim = getattr(backbone.config, "hidden_size", None)
+        if dim:
+            return dim
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        return None
+    for key in ("ssl_features", "ssl_hidden_states"):
+        if batch.get(key) is not None:
+            return int(batch[key].shape[-1])
+    return None
 
 
 def _resolve_io(args):
@@ -251,14 +309,26 @@ def run_lomo(args, device):
         )
         cfg = ModelConfig(handcrafted_dim=len(feature_names), fusion=args.fusion,
                           num_classes=2, d_model=args.d_model, freeze_ssl=freeze)
+        if cfg.needs_ssl:
+            ssl_dim = _infer_ssl_dim(loaders["train"], backbone)
+            if ssl_dim and ssl_dim != cfg.ssl_dim:
+                print(f"  [ssl_dim] embedding real tem dim={ssl_dim} "
+                      f"(default da ModelConfig era {cfg.ssl_dim}) — ajustando.")
+                cfg.ssl_dim = ssl_dim
         print(f"\n[LOMO] held-out = {held}  (train={len(tr)} val={len(va)} test={len(te)})")
+        base_name = Path(args.out).stem if args.out else "lomo"
+        tb_writer = _make_tb_writer(args.tb_dir, f"{base_name}_held_{held}")
         model, _, _ = train_one_run(
             cfg, loaders["train"], loaders["val"], train_labels=y_bin[tr], ssl_backbone=backbone,
             epochs=args.epochs, lr=args.lr, use_feature_loss=args.feature_loss,
-            patience=args.patience, device=device, verbose=args.verbose,
+            patience=args.patience, device=device, verbose=args.verbose, tb_writer=tb_writer,
         )
         test = evaluate(model, loaders["test"], device, 2)
         print(f"[LOMO] {held}: test EER={test['eer']:.4f}  AUC={test['auc']:.4f}")
+        if tb_writer is not None:
+            for k in ("eer", "auc", "acc", "f1"):
+                tb_writer.add_scalar(f"test/{k}", test[k], 0)
+            tb_writer.close()
         rows.append({"held_out_model": held, **test})
 
     print("\n=== Tabela de generalização (unseen synthesizer) ===")
@@ -289,6 +359,12 @@ def run_standard(args, device):
     num_classes = len(bundle.label_info.classes)
     cfg = ModelConfig(handcrafted_dim=len(bundle.feature_names), fusion=args.fusion,
                       num_classes=num_classes, d_model=args.d_model, freeze_ssl=freeze)
+    if cfg.needs_ssl:
+        ssl_dim = _infer_ssl_dim(bundle.loaders["train"], backbone)
+        if ssl_dim and ssl_dim != cfg.ssl_dim:
+            print(f"  [ssl_dim] embedding real tem dim={ssl_dim} "
+                  f"(default da ModelConfig era {cfg.ssl_dim}) — ajustando.")
+            cfg.ssl_dim = ssl_dim
     print(f"features={len(bundle.feature_names)}  subset={args.feature_subset}  "
           f"classes={bundle.label_info.classes}  fusion={args.fusion}  "
           f"feature_names={bundle.feature_names}")
@@ -298,16 +374,30 @@ def run_standard(args, device):
     train_labels, _ = map_labels(train_y, multiclass=args.multiclass,
                                  bonafide_aliases=args.bonafide_aliases)
 
+    run_name = Path(args.out).stem if args.out else "run"
+    tb_writer = _make_tb_writer(args.tb_dir, run_name)
+
     model, best_val, _ = train_one_run(
         cfg, bundle.loaders["train"], bundle.loaders["val"], train_labels=train_labels,
         ssl_backbone=backbone, epochs=args.epochs, lr=args.lr,
         use_feature_loss=args.feature_loss, patience=args.patience,
-        device=device, verbose=args.verbose,
+        device=device, verbose=args.verbose, tb_writer=tb_writer,
     )
     test = evaluate(model, bundle.loaders["test"], device, num_classes)
     print(f"\nMelhor val: EER={best_val['eer']:.4f} AUC={best_val['auc']:.4f}")
     print(f"Teste:      EER={test['eer']:.4f} AUC={test['auc']:.4f} "
           f"acc={test['acc']:.3f} f1={test['f1']:.3f}")
+
+    if tb_writer is not None:
+        for k in ("eer", "auc", "acc", "f1"):
+            tb_writer.add_scalar(f"test/{k}", test[k], 0)
+        tb_writer.add_hparams(
+            {"fusion": args.fusion, "feature_subset": args.feature_subset,
+             "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr},
+            {f"hparam/test_{k}": test[k] for k in ("eer", "auc", "acc", "f1")},
+            run_name=".",
+        )
+        tb_writer.close()
 
     if args.out:
         torch.save({
@@ -365,6 +455,17 @@ def build_argparser() -> argparse.ArgumentParser:
             "normalmente e o resultado é salvo nesse diretório. Útil em ablações "
             "(várias chamadas de Train.py no mesmo --feature-cache-dir reusam a "
             "mesma extração). Não se aplica com --lomo."
+        ),
+    )
+    p.add_argument(
+        "--tb-dir", type=str, default=None, metavar="DIR",
+        help=(
+            "Diretório raiz do TensorBoard. Cada run grava em <DIR>/<nome>, "
+            "onde <nome> vem do nome do arquivo de --out (ex.: --out "
+            "checkpoints/A1_scalar_only.pt -> <DIR>/A1_scalar_only). Loga "
+            "train/loss (+ componentes da FeatureLoss), val/{eer,auc,acc,f1} "
+            "por época e test/{eer,auc,acc,f1} no final. Veja com: "
+            "tensorboard --logdir <DIR>"
         ),
     )
     p.add_argument("--quiet", dest="verbose", action="store_false")

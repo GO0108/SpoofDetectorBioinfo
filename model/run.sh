@@ -43,16 +43,14 @@
 # CORPUS JÁ DIVIDIDO EM PASTAS train/dev/test (split oficial, sem locutor
 # repetido entre elas)? Não use esse fluxo de --metrics/--reaper único (ele
 # concatena tudo e REDIVIDE por locutor, perdendo o split oficial). Em vez
-# disso, rode f0_extraction.py em CADA pasta separadamente e processe cada
-# saída com build_features.py direto para os nomes que o cache espera:
+# disso, rode f0_extraction.py em CADA pasta separadamente, com --output já
+# apontando pro nome que o cache espera (ele PULA sozinho se o arquivo já
+# existir, e já calcula tudo: escalares, pausa e F0 — não precisa de mais
+# nenhum script):
 #
-#   python3 f0_extraction.py /dados/train --output raw_train.parquet
-#   python3 f0_extraction.py /dados/dev   --output raw_dev.parquet
-#   python3 f0_extraction.py /dados/test  --output raw_test.parquet
-#
-#   python3 build_features.py raw_train.parquet --out resultados/feature_cache/train_features.parquet
-#   python3 build_features.py raw_dev.parquet   --out resultados/feature_cache/dev_features.parquet
-#   python3 build_features.py raw_test.parquet  --out resultados/feature_cache/test_features.parquet
+#   python3 f0_extraction.py /dados/train --output resultados/feature_cache/train_features.parquet
+#   python3 f0_extraction.py /dados/dev   --output resultados/feature_cache/dev_features.parquet
+#   python3 f0_extraction.py /dados/test  --output resultados/feature_cache/test_features.parquet
 #
 #   bash run_experiments.sh --out resultados --skip-export --no-xlsr
 #
@@ -106,8 +104,9 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 # --------------------------------------------------------------------------- #
 # --metrics só é obrigatório se a ETAPA 1 for rodar de fato (sem --skip-export).
 # Com --skip-export + --feature-cache-dir já populado (ex.: split oficial
-# pré-extraído com build_features.py), nem $METRICS nem $PARQUET_OUT chegam a
-# ser lidos pelo Train.py — então não faz sentido exigir --metrics aqui.
+# pré-extraído com f0_extraction.py, --output direto pros nomes do cache), nem
+# $METRICS nem $PARQUET_OUT chegam a ser lidos pelo Train.py — então não faz
+# sentido exigir --metrics aqui.
 if [[ $SKIP_EXPORT -eq 0 && -z "$METRICS" ]]; then
     echo "[ERRO] --metrics é obrigatório (ou use --skip-export se o parquet"
     echo "       unificado/cache de features já existir)."
@@ -137,8 +136,9 @@ EMB_DIR="$OUT/xlsr_embeddings"
 CKPT_DIR="$OUT/checkpoints"
 LOG_DIR="$OUT/logs"
 CACHE_DIR="$OUT/feature_cache"   # cache do split train/dev/test (ver ETAPA 3)
+TB_DIR="$OUT/tensorboard"       # curvas de treino/val/teste de cada ablação
 
-mkdir -p "$OUT" "$EMB_DIR" "$CKPT_DIR" "$LOG_DIR" "$CACHE_DIR"
+mkdir -p "$OUT" "$EMB_DIR" "$CKPT_DIR" "$LOG_DIR" "$CACHE_DIR" "$TB_DIR"
 
 # Helper: adiciona --device só se foi passado explicitamente
 device_flag() {
@@ -319,8 +319,24 @@ parquet = "$PARQUET_OUT"
 wav_dir = "$WAVS"
 emb_dir = Path("$EMB_DIR")
 emb_dir.mkdir(parents=True, exist_ok=True)
+cache_dir = Path("$CACHE_DIR")
 
-df = pd.read_parquet(parquet)
+if Path(parquet).exists():
+    df = pd.read_parquet(parquet)
+else:
+    # Sem full_metrics.parquet (ex.: --skip-export + cache por split já
+    # pronto) -- junta os 3 parquets do cache só pra saber QUAIS arquivos
+    # extrair embedding. Não precisa existir um full_metrics.parquet à parte.
+    split_files = [cache_dir / f"{n}_features.parquet" for n in ("train", "dev", "test")]
+    missing = [f for f in split_files if not f.exists()]
+    if missing:
+        print(f"[ERRO] Nem '{parquet}' nem o cache completo em '{cache_dir}' existem.")
+        print(f"       Faltam: {[str(f) for f in missing]}")
+        raise SystemExit(1)
+    print(f"  '{parquet}' não existe -- usando o cache em {cache_dir} "
+          f"pra saber quais arquivos extrair embedding.")
+    df = pd.concat([pd.read_parquet(f) for f in split_files], ignore_index=True)
+
 print(f"  {len(df)} utterances a processar")
 
 # Usa o DynamicEmbeddingLoader do Embeddings.py com cache em disco
@@ -402,11 +418,12 @@ run_experiment() {
         --feature-loss \
         --patience 7 \
         --out "$CKPT" \
+        --tb-dir "$TB_DIR" \
         $SUBSET_FLAG \
         $EMB_FLAG \
         $CACHE_FLAG \
         $(device_flag) \
-        2>&1 | tee "$LOG" | grep -E "(ep |Melhor|Teste|features=|ERRO|cache)" || true
+        2>&1 | tee "$LOG" | grep -E "(ep |Melhor|Teste|features=|ERRO|cache|tensorboard)" || true
 
     # Extrai métricas finais do log e adiciona à tabela
     local TEST_LINE
@@ -467,5 +484,6 @@ fi
 # --------------------------------------------------------------------------- #
 log "=== CONCLUÍDO ==="
 log "Resultados: $OUT/resultados_ablacao.txt"
+log "TensorBoard (curvas de todas as ablações): tensorboard --logdir $TB_DIR"
 echo ""
 cat "$OUT/resultados_ablacao.txt"

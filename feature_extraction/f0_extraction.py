@@ -35,6 +35,7 @@ Uso:
 """
 
 import argparse
+import contextlib
 import os
 import traceback
 import warnings
@@ -51,6 +52,29 @@ from parselmouth.praat import call
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
+
+
+@contextlib.contextmanager
+def _suppress_c_stdio():
+    """Silencia stdout/stderr no nível do file descriptor durante o bloco.
+
+    Mensagens como "Residual symmetry: P:... N:... MEAN:..." e "Inverting
+    signal" vêm da lib C do REAPER (printf direto, não passa por sys.stdout
+    nem por warnings.filterwarnings) — só some redirecionando o fd mesmo."""
+    stdout_fd, stderr_fd = 1, 2
+    saved_stdout = os.dup(stdout_fd)
+    saved_stderr = os.dup(stderr_fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, stdout_fd)
+        os.dup2(devnull, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_stdout, stdout_fd)
+        os.dup2(saved_stderr, stderr_fd)
+        os.close(devnull)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
 
 
 def extract_pause_features(times: np.ndarray, f0: np.ndarray, y: np.ndarray, sr: int) -> dict:
@@ -120,7 +144,8 @@ def extract_one(wav_path: Path, keep_raw_reaper: bool = False) -> dict:
         y_int16 = y_int16.mean(axis=1).astype(np.int16)
 
     # F0 via REAPER
-    _, _, times_reaper, f0_reaper, corr = pyreaper.reaper(y_int16, sr)
+    with _suppress_c_stdio():
+        _, _, times_reaper, f0_reaper, corr = pyreaper.reaper(y_int16, sr)
 
 
     # Praat
@@ -204,6 +229,7 @@ def main():
     args = parser.parse_args()
 
     out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Retomada: se --output já existe (de uma rodada anterior/interrompida),
     # carrega o que já foi processado e só extrai o que falta. --force ignora
